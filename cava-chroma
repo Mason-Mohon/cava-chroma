@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""cava-chroma: cava bars with colors that follow the pitch and tone of the music.
+
+Cava does the audio capture and the FFT. This script reads the raw bar values
+from cava and draws the bars in 24-bit color.
+
+Each bar covers a frequency band, so each bar has a musical note.
+The script uses the note and the loudness of each band to choose colors.
+
+Modes (press m to change):
+  key    The palette follows the loudest note in the music. The bars spread
+         into nearby colors from bass to treble.
+  notes  Each bar has the color of its own note. Loud notes glow.
+  tone   The palette follows the tone of the music: bass-heavy sound is warm,
+         bright sound is cool.
+
+Keys: m = next mode, f = chromatic or circle-of-fifths colors,
+      h = hide or show the top line, q = quit.
+"""
+import colorsys
+import math
+import os
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import termios
+import tty
+
+LOW_HZ = 40
+HIGH_HZ = 12000
+MAX_BARS = 256  # cava needs about 43 Hz of bandwidth for each bar
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+MODES = ["key", "notes", "tone"]
+BLOCKS = " ▁▂▃▄▅▆▇█"
+
+CAVA_CONFIG = """\
+[general]
+bars = {bars}
+framerate = 60
+autosens = 1
+lower_cutoff_freq = {low}
+higher_cutoff_freq = {high}
+
+[output]
+method = raw
+raw_target = /dev/stdout
+data_format = ascii
+ascii_max_range = 1000
+bar_delimiter = 59
+frame_delimiter = 10
+channels = mono
+mono_option = average
+
+[smoothing]
+noise_reduction = 70
+"""
+
+
+def pitch_class(freq):
+    """Return the pitch class of a frequency as a float in [0, 12). C = 0."""
+    return (69 + 12 * math.log2(freq / 440.0)) % 12
+
+
+class Palette:
+    """Keeps the state that the music drives, and turns it into colors."""
+
+    def __init__(self, bars):
+        ratio = HIGH_HZ / LOW_HZ
+        freqs = [LOW_HZ * ratio ** ((i + 0.5) / bars) for i in range(bars)]
+        self.bars = bars
+        self.pcs = [pitch_class(f) for f in freqs]
+        self.notes = [int(round(pc)) % 12 for pc in self.pcs]
+        # Only bands from about 80 Hz to 5 kHz carry useful pitch information.
+        self.pitched = [80 <= f <= 5000 for f in freqs]
+        self.chroma = [0.0] * 12
+        self.key_vec = [1.0, 0.0]
+        self.centroid = 0.5
+        self.level = 0.0
+        self.fifths = False
+        self.mode = 0
+
+    def note_hue(self, pc):
+        if self.fifths:
+            pc = (pc * 7) % 12
+        return pc / 12.0
+
+    def update(self, vals):
+        n = self.bars
+        frame = [0.0] * 12
+        total = 0.0
+        weighted = 0.0
+        for i, v in enumerate(vals):
+            total += v
+            weighted += i * v
+            if self.pitched[i]:
+                frame[self.notes[i]] += v * v
+        for k in range(12):
+            self.chroma[k] = 0.88 * self.chroma[k] + 0.12 * frame[k]
+
+        self.level = 0.9 * self.level + 0.1 * min(1.0, total / (n * 400.0))
+        if total > 0:
+            self.centroid = 0.95 * self.centroid + 0.05 * (weighted / total / max(1, n - 1))
+
+        peak = max(self.chroma)
+        if peak <= 0:
+            return
+        mean = sum(self.chroma) / 12
+        confidence = (peak - mean) / peak
+        hue = self.note_hue(self.key_note()) * 2 * math.pi
+        rate = 0.10 * confidence
+        self.key_vec[0] += rate * (math.cos(hue) - self.key_vec[0])
+        self.key_vec[1] += rate * (math.sin(hue) - self.key_vec[1])
+
+    def key_note(self):
+        return max(range(12), key=lambda k: self.chroma[k])
+
+    def key_hue(self):
+        return (math.atan2(self.key_vec[1], self.key_vec[0]) / (2 * math.pi)) % 1.0
+
+    def bar_colors(self, vals):
+        """Return a (hue, saturation, glow) tuple for each bar."""
+        n = self.bars
+        mode = MODES[self.mode]
+        peak = max(self.chroma) or 1.0
+        out = []
+        if mode == "key":
+            base = self.key_hue()
+            spread = 0.20 + 0.40 * self.centroid
+            for i, v in enumerate(vals):
+                x = i / max(1, n - 1) - 0.5
+                out.append(((base + spread * x) % 1.0, 0.70 + 0.30 * v / 1000, v / 1000))
+        elif mode == "notes":
+            for i, v in enumerate(vals):
+                active = self.chroma[self.notes[i]] / peak
+                out.append((self.note_hue(self.pcs[i]), 0.35 + 0.65 * active, 0.4 * active + 0.6 * v / 1000))
+        else:
+            # Warm red for bass-heavy sound, through to blue for bright sound.
+            base = 0.66 * min(1.0, self.centroid * 1.6)
+            for i, v in enumerate(vals):
+                x = i / max(1, n - 1)
+                out.append(((base + 0.30 * x) % 1.0, 0.65 + 0.35 * self.level, v / 1000))
+        return out
+
+
+def rgb(h, s, v):
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return f"\x1b[38;2;{int(r * 255)};{int(g * 255)};{int(b * 255)}m"
+
+
+def layout():
+    cols, rows = shutil.get_terminal_size()
+    width = 2
+    while cols // (width + 1) > MAX_BARS:
+        width += 1
+    bars = max(4, cols // (width + 1))
+    margin = max(0, (cols - bars * (width + 1) + 1) // 2)
+    return bars, width, margin, cols, max(2, rows - 1)
+
+
+def find_cava():
+    """Use the cava binary next to this script if one exists, else cava from PATH."""
+    local = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cava")
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        return local
+    return shutil.which("cava")
+
+
+def start_cava(cava_bin, bars, conf_path, err_file):
+    with open(conf_path, "w") as f:
+        f.write(CAVA_CONFIG.format(bars=bars, low=LOW_HZ, high=HIGH_HZ))
+    return subprocess.Popen([cava_bin, "-p", conf_path], stdout=subprocess.PIPE,
+                            stderr=err_file, stdin=subprocess.DEVNULL)
+
+
+def draw(out, pal, vals, width, margin, cols, height, show_status):
+    colors = pal.bar_colors(vals)
+    lines = []
+    if not show_status:
+        height += 1
+
+    note = pal.key_note() if max(pal.chroma) > 0 else None
+    if note is None:
+        status = "  ♪ --"
+        head = "\x1b[0m"
+    else:
+        status = f"  ♪ {NOTE_NAMES[note]:<2}"
+        head = rgb(pal.note_hue(note), 0.8, 1.0)
+    info = (f"   mode: {MODES[pal.mode]}   colors: {'fifths' if pal.fifths else 'chromatic'}"
+            f"   tone: {int(pal.centroid * 100):>3}%   [m] mode  [f] colors  [h] hide  [q] quit")
+    if show_status:
+        lines.append(head + "\x1b[1m" + status + "\x1b[0;2m" + info[: max(0, cols - len(status))] + "\x1b[0m\x1b[K")
+
+    heights = [v * height * 8 // 1000 for v in vals]
+    pad = " " * margin
+    gap = " "
+    for row in range(height):
+        from_bottom = height - 1 - row
+        floor = from_bottom * 8
+        parts = [pad]
+        for i, h8 in enumerate(heights):
+            if h8 <= floor:
+                parts.append(" " * width + gap)
+                continue
+            hue, sat, glow = colors[i]
+            # Each bar is brightest at its tip. Loud bars are brighter overall.
+            tip = min(1.0, (floor + 8) / h8)
+            val = min(1.0, (0.40 + 0.60 * tip ** 1.5) * (0.70 + 0.30 * glow) + 0.10 * glow)
+            char = BLOCKS[min(8, h8 - floor)]
+            parts.append(rgb(hue, sat, val) + char * width + "\x1b[0m" + gap)
+        lines.append("".join(parts) + "\x1b[K")
+    out.write(("\x1b[H" + "\r\n".join(lines)).encode())
+    out.flush()
+
+
+def main():
+    cava_bin = find_cava()
+    if cava_bin is None:
+        sys.exit("cava-chroma: cava is not installed.")
+
+    resized = [False]
+    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
+
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    conf_fd, conf_path = tempfile.mkstemp(prefix="cava-chroma-", suffix=".conf", dir=runtime)
+    os.close(conf_fd)
+    err_file = tempfile.TemporaryFile()
+
+    stdin_fd = sys.stdin.fileno()
+    old_tty = termios.tcgetattr(stdin_fd)
+    out = sys.stdout.buffer
+    out.write(b"\x1b[?1049h\x1b[?25l\x1b[2J")
+    out.flush()
+    tty.setcbreak(stdin_fd)
+
+    cava = None
+    failed = False
+    pal_mode, pal_fifths = 0, False
+    show_status = True
+    try:
+        while True:
+            bars, width, margin, cols, height = layout()
+            pal = Palette(bars)
+            pal.mode, pal.fifths = pal_mode, pal_fifths
+            cava = start_cava(cava_bin, bars, conf_path, err_file)
+            cava_fd = cava.stdout.fileno()
+            buf = b""
+            resized[0] = False
+            out.write(b"\x1b[2J")
+
+            while not resized[0]:
+                ready, _, _ = select.select([cava_fd, stdin_fd], [], [], 1.0)
+                if stdin_fd in ready:
+                    key = os.read(stdin_fd, 32).decode(errors="ignore").lower()
+                    if "q" in key or "\x1b" in key:
+                        return
+                    if "m" in key:
+                        pal.mode = pal_mode = (pal.mode + 1) % len(MODES)
+                    if "h" in key:
+                        show_status = not show_status
+                    if "f" in key:
+                        pal.fifths = pal_fifths = not pal.fifths
+                if cava_fd not in ready:
+                    continue
+                chunk = os.read(cava_fd, 65536)
+                if not chunk:
+                    failed = True
+                    return
+                buf += chunk
+                if b"\n" not in buf:
+                    continue
+                # Draw only the newest complete frame, so the display never lags.
+                frames = buf.split(b"\n")
+                buf = frames[-1]
+                fields = frames[-2].split(b";")
+                vals = [int(x) for x in fields if x][:bars]
+                if len(vals) < bars:
+                    continue
+                pal.update(vals)
+                draw(out, pal, vals, width, margin, cols, height, show_status)
+
+            cava.terminate()
+            cava.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if cava and cava.poll() is None:
+            cava.terminate()
+            cava.wait()
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty)
+        out.write(b"\x1b[0m\x1b[?25h\x1b[?1049l")
+        out.flush()
+        os.unlink(conf_path)
+        if failed:
+            err_file.seek(0)
+            sys.stderr.write("cava-chroma: cava stopped.\n" + err_file.read().decode(errors="ignore"))
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -5,6 +5,75 @@ CAVA [![Build Status](https://github.com/karlstav/cava/workflows/build-and-test/
 
 by [Karl Stavestrand](mailto:karl@stavestrand.no)
 
+> [!NOTE]
+> **This repository is cava-chroma.** cava-chroma is cava plus `cava-chroma`, a visualizer whose colors follow the music.
+> The original cava README is below this section, unchanged.
+> Upstream project: [karlstav/cava](https://github.com/karlstav/cava).
+
+## cava-chroma
+
+`cava-chroma` draws cava bars in 24-bit color.
+The colors follow the notes and the tone of the music.
+
+Cava captures the audio and calculates the frequency bands.
+`cava-chroma` reads the raw bar values from cava and draws the bars itself.
+Each bar covers a frequency range, so each bar has a musical note.
+`cava-chroma` also finds the loudest note in the music in real time.
+
+### Color modes
+
+Press `m` to change the mode.
+
+| Mode | Colors |
+| --- | --- |
+| `key` (default) | The colors follow the loudest note. The bars spread into nearby colors from bass to treble. Brighter-sounding music gives a wider color spread. |
+| `notes` | Each bar has the color of its own note, so the colors repeat each octave. Notes that the music plays glow. Other notes fade. |
+| `tone` | The colors follow the tone of the sound. Bass-heavy music is red or orange. Bright music is cyan or blue. |
+
+### Keys
+
+| Key | Action |
+| --- | --- |
+| `m` | Go to the next color mode. |
+| `f` | Change the note-to-color map from chromatic to circle of fifths. |
+| `h` | Hide or show the status line at the top. |
+| `q` or `Esc` | Quit. |
+
+### Requirements
+
+- Python 3.8 or later. `cava-chroma` uses only the Python standard library.
+- `cava` 1.0 or later, with raw output support.
+- A terminal with 24-bit color.
+
+### Install
+
+Build and install cava from this repository. `make install` also installs `cava-chroma`:
+
+```sh
+./autogen.sh
+./configure
+make
+sudo make install
+```
+
+If cava is already installed, copy only the script:
+
+```sh
+install -Dm755 cava-chroma ~/.local/bin/cava-chroma
+```
+
+`cava-chroma` uses the `cava` binary in its own directory if one exists.
+If no binary exists there, `cava-chroma` uses `cava` from `PATH`.
+`cava-chroma` writes its own temporary cava config, so your normal cava config does not change.
+
+### Limits
+
+- The note detection is approximate. Overtones can move the readout to a related note, usually a fifth away.
+- The notes of deep bass are the least accurate, because cava's low bands are wider than one semitone.
+
+---
+
+
 Now also supports [dumb terminals](https://github.com/karlstav/cava/blob/master/TERMINAL.md)!
 
 ![spectrum](https://github.com/karlstav/cava/blob/master/example_files/cava.gif "spectrum")

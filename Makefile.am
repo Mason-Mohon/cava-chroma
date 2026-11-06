@@ -3,6 +3,7 @@ AUTOMAKE_OPTIONS = foreign
 ACLOCAL_AMFLAGS = -I m4
 
 bin_PROGRAMS = cava
+dist_bin_SCRIPTS = cava-chroma
 cavadir = $(top_srcdir)
 cava_SOURCES = cava.c cavacore.c config.c input/common.c input/fifo.c input/shmem.c \
                output/terminal_noncurses.c output/raw.c output/noritake.c \
